@@ -3,20 +3,119 @@ CyberShield — Cybersecurity Toolkit Backend
 Flask API serving 8 security tools.
 """
 
-from flask import Flask, render_template, request, jsonify
-import hashlib
-import requests
-import socket
 import base64
+import binascii
+import hashlib
+import ipaddress
 import re
 import math
 import string
 import secrets
+import socket
+import threading
+import time
 import urllib.parse
 import os
-from collections import Counter
+from flask import Flask, render_template, request, jsonify
+import requests
 
 app = Flask(__name__)
+
+NETWORK_TIMEOUT_SECONDS = 10
+PORT_SCAN_TIMEOUT_SECONDS = 0.8
+MAX_PORT_SCAN_REQUESTS_PER_MINUTE = int(os.environ.get("PORT_SCAN_RPM", "10"))
+MAX_HEADERS_REQUESTS_PER_MINUTE = int(os.environ.get("HEADERS_RPM", "20"))
+
+_rate_limit_lock = threading.Lock()
+_rate_limit_store = {}
+
+
+def parse_json_payload():
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return None, jsonify({"error": "Request body must be valid JSON"}), 400
+    if not isinstance(payload, dict):
+        return None, jsonify({"error": "JSON payload must be an object"}), 400
+    return payload, None, None
+
+
+def rate_limit_or_response(bucket_key, limit_per_minute):
+    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown")
+    if "," in client_ip:
+        client_ip = client_ip.split(",", 1)[0].strip()
+
+    now = time.time()
+    window = 60
+    key = f"{bucket_key}:{client_ip}"
+
+    with _rate_limit_lock:
+        timestamps = [ts for ts in _rate_limit_store.get(key, []) if now - ts < window]
+        if len(timestamps) >= limit_per_minute:
+            return (
+                jsonify({"error": "Rate limit exceeded. Please retry in a minute."}),
+                429,
+            )
+        timestamps.append(now)
+        _rate_limit_store[key] = timestamps
+
+    return None
+
+
+def is_blocked_ip(ip_text):
+    ip_obj = ipaddress.ip_address(ip_text)
+    return (
+        ip_obj.is_private
+        or ip_obj.is_loopback
+        or ip_obj.is_link_local
+        or ip_obj.is_multicast
+        or ip_obj.is_reserved
+        or ip_obj.is_unspecified
+    )
+
+
+def resolve_public_ipv4(hostname):
+    if not hostname:
+        raise ValueError("Target host is required")
+
+    if hostname.lower() == "localhost":
+        raise ValueError("Localhost targets are not allowed")
+
+    try:
+        ip_obj = ipaddress.ip_address(hostname)
+        if ip_obj.version != 4:
+            raise ValueError("Only IPv4 targets are supported")
+        if is_blocked_ip(hostname):
+            raise ValueError("Private/internal targets are not allowed")
+        return hostname
+    except ValueError:
+        pass
+
+    try:
+        target_ip = socket.gethostbyname(hostname)
+    except socket.gaierror as exc:
+        raise ValueError(f"Cannot resolve hostname: {hostname}") from exc
+
+    if is_blocked_ip(target_ip):
+        raise ValueError("Private/internal targets are not allowed")
+
+    return target_ip
+
+
+def normalize_url(raw_url):
+    cleaned = (raw_url or "").strip()
+    if not cleaned:
+        raise ValueError("URL is required")
+
+    if not cleaned.startswith(("http://", "https://")):
+        cleaned = "https://" + cleaned
+
+    parsed = urllib.parse.urlparse(cleaned)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Only http and https URLs are allowed")
+    if not parsed.netloc:
+        raise ValueError("URL must include a valid host")
+
+    return cleaned, parsed
 
 # ──────────────────────────────────────────────
 # ROUTE: Home
@@ -31,8 +130,13 @@ def index():
 # ──────────────────────────────────────────────
 @app.route("/api/password-analyze", methods=["POST"])
 def password_analyze():
-    data = request.json
+    data, error_response, status = parse_json_payload()
+    if error_response:
+        return error_response, status
+
     password = data.get("password", "")
+    if not isinstance(password, str):
+        return jsonify({"error": "Password must be a string"}), 400
 
     if not password:
         return jsonify({"error": "Password is required"}), 400
@@ -125,17 +229,21 @@ def password_analyze():
         sha1 = hashlib.sha1(password.encode()).hexdigest().upper()
         prefix, suffix = sha1[:5], sha1[5:]
         resp = requests.get(
-            f"https://api.pwnedpasswords.com/range/{prefix}", timeout=5
+            f"https://api.pwnedpasswords.com/range/{prefix}",
+            timeout=NETWORK_TIMEOUT_SECONDS,
         )
         if resp.status_code == 200:
             for line in resp.text.splitlines():
-                h, c = line.split(":")
+                parts = line.split(":")
+                if len(parts) != 2:
+                    continue
+                h, c = parts
                 if h == suffix:
                     breached = True
                     breach_count = int(c)
                     break
-    except Exception:
-        pass
+    except (requests.RequestException, ValueError):
+        app.logger.warning("HIBP check failed for password analysis")
 
     return jsonify(
         {
@@ -158,13 +266,22 @@ def password_analyze():
 # ──────────────────────────────────────────────
 @app.route("/api/password-generate", methods=["POST"])
 def password_generate():
-    data = request.json
-    length = min(max(int(data.get("length", 16)), 4), 128)
-    use_upper = data.get("uppercase", True)
-    use_lower = data.get("lowercase", True)
-    use_digits = data.get("digits", True)
-    use_special = data.get("special", True)
-    exclude_ambiguous = data.get("exclude_ambiguous", False)
+    data, error_response, status = parse_json_payload()
+    if error_response:
+        return error_response, status
+
+    length_raw = data.get("length", 16)
+    try:
+        length = int(length_raw)
+    except (TypeError, ValueError):
+        return jsonify({"error": "length must be a number"}), 400
+
+    length = min(max(length, 4), 128)
+    use_upper = bool(data.get("uppercase", True))
+    use_lower = bool(data.get("lowercase", True))
+    use_digits = bool(data.get("digits", True))
+    use_special = bool(data.get("special", True))
+    exclude_ambiguous = bool(data.get("exclude_ambiguous", False))
 
     pool = ""
     required = []
@@ -195,6 +312,9 @@ def password_generate():
     if not pool:
         pool = string.ascii_letters + string.digits
 
+    if length < len(required):
+        length = len(required)
+
     remaining = length - len(required)
     pwd_list = required + [secrets.choice(pool) for _ in range(remaining)]
 
@@ -212,8 +332,13 @@ def password_generate():
 # ──────────────────────────────────────────────
 @app.route("/api/hash-generate", methods=["POST"])
 def hash_generate():
-    data = request.json
+    data, error_response, status = parse_json_payload()
+    if error_response:
+        return error_response, status
+
     text = data.get("text", "")
+    if not isinstance(text, str):
+        return jsonify({"error": "text must be a string"}), 400
 
     results = {
         "MD5": hashlib.md5(text.encode()).hexdigest(),
@@ -234,11 +359,21 @@ def hash_generate():
 # ──────────────────────────────────────────────
 @app.route("/api/encode-decode", methods=["POST"])
 def encode_decode():
-    data = request.json
+    data, error_response, status = parse_json_payload()
+    if error_response:
+        return error_response, status
+
     text = data.get("text", "")
     operation = data.get("operation", "encode")
     method = data.get("method", "base64")
     key = data.get("key", "3")
+
+    if not isinstance(text, str):
+        return jsonify({"error": "text must be a string"}), 400
+    if operation not in {"encode", "decode"}:
+        return jsonify({"error": "operation must be 'encode' or 'decode'"}), 400
+    if method not in {"base64", "base32", "hex", "binary", "url", "caesar", "rot13", "xor", "morse"}:
+        return jsonify({"error": "Unsupported method"}), 400
 
     try:
         if method == "base64":
@@ -264,6 +399,8 @@ def encode_decode():
                 result = " ".join(format(ord(c), "08b") for c in text)
             else:
                 bits = text.replace(" ", "")
+                if not bits or len(bits) % 8 != 0 or not set(bits).issubset({"0", "1"}):
+                    return jsonify({"error": "Invalid binary input"}), 400
                 result = "".join(
                     chr(int(bits[i : i + 8], 2)) for i in range(0, len(bits), 8)
                 )
@@ -275,6 +412,8 @@ def encode_decode():
                 result = urllib.parse.unquote(text)
 
         elif method == "caesar":
+            if not isinstance(key, str):
+                key = str(key)
             shift = int(key) if key.lstrip("-").isdigit() else 3
             if operation == "decode":
                 shift = -shift
@@ -296,6 +435,8 @@ def encode_decode():
                     result += ch
 
         elif method == "xor":
+            if not isinstance(key, str):
+                key = str(key)
             k = key if key else "K"
             xored = "".join(
                 chr(ord(c) ^ ord(k[i % len(k)])) for i, c in enumerate(text)
@@ -325,12 +466,9 @@ def encode_decode():
                 REV = {v: k for k, v in MORSE.items()}
                 result = "".join(REV.get(c, c) for c in text.split(" "))
 
-        else:
-            result = "Unsupported method"
-
         return jsonify({"result": result, "method": method, "operation": operation})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+    except (UnicodeDecodeError, ValueError, binascii.Error):
+        return jsonify({"error": "Input cannot be decoded using the selected method"}), 400
 
 
 # ──────────────────────────────────────────────
@@ -338,8 +476,20 @@ def encode_decode():
 # ──────────────────────────────────────────────
 @app.route("/api/port-scan", methods=["POST"])
 def port_scan():
-    data = request.json
-    target = data.get("target", "").strip()
+    limited = rate_limit_or_response("port_scan", MAX_PORT_SCAN_REQUESTS_PER_MINUTE)
+    if limited:
+        return limited
+
+    data, error_response, status = parse_json_payload()
+    if error_response:
+        return error_response, status
+
+    target = data.get("target", "")
+    if not isinstance(target, str):
+        return jsonify({"error": "target must be a string"}), 400
+    target = target.strip()
+    if not target:
+        return jsonify({"error": "Target is required"}), 400
 
     COMMON_PORTS = {
         21: "FTP",
@@ -372,17 +522,17 @@ def port_scan():
     }
 
     try:
-        target_ip = socket.gethostbyname(target)
-    except socket.gaierror:
-        return jsonify({"error": f"Cannot resolve hostname: {target}"}), 400
+        target_ip = resolve_public_ipv4(target)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
     open_ports = []
     closed_count = 0
 
     for port, service in COMMON_PORTS.items():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(0.8)
+            sock.settimeout(PORT_SCAN_TIMEOUT_SECONDS)
             result = sock.connect_ex((target_ip, port))
             if result == 0:
                 # Try banner grab
@@ -390,16 +540,17 @@ def port_scan():
                 try:
                     sock.send(b"HEAD / HTTP/1.0\r\n\r\n")
                     banner = sock.recv(100).decode("utf-8", errors="ignore").strip()[:80]
-                except Exception:
-                    pass
+                except (OSError, socket.timeout):
+                    banner = ""
                 open_ports.append(
                     {"port": port, "service": service, "status": "Open", "banner": banner}
                 )
             else:
                 closed_count += 1
-            sock.close()
-        except Exception:
+        except OSError:
             closed_count += 1
+        finally:
+            sock.close()
 
     return jsonify(
         {
@@ -418,11 +569,28 @@ def port_scan():
 # ──────────────────────────────────────────────
 @app.route("/api/security-headers", methods=["POST"])
 def security_headers():
-    data = request.json
-    url = data.get("url", "").strip()
+    limited = rate_limit_or_response("security_headers", MAX_HEADERS_REQUESTS_PER_MINUTE)
+    if limited:
+        return limited
 
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
+    data, error_response, status = parse_json_payload()
+    if error_response:
+        return error_response, status
+
+    raw_url = data.get("url", "")
+    if not isinstance(raw_url, str):
+        return jsonify({"error": "url must be a string"}), 400
+
+    try:
+        url, parsed = normalize_url(raw_url)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    host = parsed.hostname or ""
+    try:
+        resolve_public_ipv4(host)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
     HEADERS_INFO = {
         "Strict-Transport-Security": {
@@ -478,7 +646,12 @@ def security_headers():
     }
 
     try:
-        resp = requests.get(url, timeout=10, allow_redirects=True, verify=True)
+        resp = requests.get(
+            url,
+            timeout=NETWORK_TIMEOUT_SECONDS,
+            allow_redirects=False,
+            verify=True,
+        )
         headers = dict(resp.headers)
 
         results = []
@@ -531,11 +704,13 @@ def security_headers():
             }
         )
     except requests.exceptions.SSLError:
-        return jsonify({"error": "SSL Certificate verification failed"}), 400
+        return jsonify({"error": "SSL certificate verification failed"}), 400
     except requests.exceptions.ConnectionError:
         return jsonify({"error": "Could not connect to the server"}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+    except requests.exceptions.Timeout:
+        return jsonify({"error": "Request timed out"}), 400
+    except requests.RequestException:
+        return jsonify({"error": "Unable to fetch headers for the requested URL"}), 400
 
 
 # ──────────────────────────────────────────────
@@ -543,8 +718,14 @@ def security_headers():
 # ──────────────────────────────────────────────
 @app.route("/api/phishing-check", methods=["POST"])
 def phishing_check():
-    data = request.json
-    url = data.get("url", "").strip()
+    data, error_response, status = parse_json_payload()
+    if error_response:
+        return error_response, status
+
+    url = data.get("url", "")
+    if not isinstance(url, str):
+        return jsonify({"error": "url must be a string"}), 400
+    url = url.strip()
 
     if not url:
         return jsonify({"error": "URL is required"}), 400
@@ -694,18 +875,29 @@ def phishing_check():
 # ──────────────────────────────────────────────
 @app.route("/api/ip-lookup", methods=["POST"])
 def ip_lookup():
-    data = request.json
-    ip = data.get("ip", "").strip()
+    data, error_response, status = parse_json_payload()
+    if error_response:
+        return error_response, status
+
+    ip = data.get("ip", "")
+    if not isinstance(ip, str):
+        return jsonify({"error": "ip must be a string"}), 400
+    ip = ip.strip()
 
     if not ip:
         return jsonify({"error": "IP address is required"}), 400
+
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return jsonify({"error": "Invalid IP address"}), 400
 
     try:
         r = requests.get(
             f"http://ip-api.com/json/{ip}?fields=status,message,country,"
             f"countryCode,region,regionName,city,zip,lat,lon,timezone,"
             f"isp,org,as,query,mobile,proxy,hosting",
-            timeout=10,
+            timeout=NETWORK_TIMEOUT_SECONDS,
         )
         result = r.json()
 
@@ -713,16 +905,12 @@ def ip_lookup():
             return jsonify({"error": result.get("message", "Lookup failed")}), 400
 
         return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+    except (requests.RequestException, ValueError):
+        return jsonify({"error": "Could not complete IP lookup"}), 400
 
 
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
-    
-    
-
-if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(debug=False, host="0.0.0.0", port=port)
+    debug = os.environ.get("FLASK_DEBUG", "0") == "1"
+    app.run(debug=debug, host="0.0.0.0", port=port)
